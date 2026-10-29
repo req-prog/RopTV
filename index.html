@@ -40,6 +40,8 @@ video{width:100%;height:100%;object-fit:contain;display:block;pointer-events:non
 .screen.full{position:fixed;inset:0;z-index:9999;aspect-ratio:auto;border-radius:0;cursor:none;background:#000}
 .screen.full .bar,.screen.full .live,.screen.full .ov{display:none!important}
 .screen.full .bug{font-size:16px;opacity:.7}
+.ov.hold{background:#0007}
+.screen.full .ov.hold:not(.hide){display:flex!important}
 .now{padding:14px 6px 4px;display:flex;justify-content:space-between;gap:8px;color:var(--dim)}
 .now strong{color:var(--ink);font-family:Unbounded;font-weight:600}
 aside{background:var(--bg2);border:1px solid var(--line);border-radius:20px;padding:18px}
@@ -63,6 +65,7 @@ aside h3 span{color:var(--amber)}
         <video id="v" playsinline muted preload="auto" disablepictureinpicture controlslist="nodownload noplaybackrate"></video>
         <div class="bug">Rop<b>TV</b></div><div class="live">В ЭФИРЕ</div>
         <div class="ov" id="off"><h2>Эфир сейчас выключен</h2><p>Как только запустят видео, оно начнётся здесь само.</p></div>
+        <div class="ov hold hide" id="hold"><h2>⏸ Эфир на паузе</h2><p>Скоро продолжим с того же места.</p></div>
         <div class="ov hide" id="gate"><h2>Идёт эфир</h2><button class="cta" id="join">Смотреть со звуком</button></div>
         <div class="bar">
           <button id="mute" aria-label="Звук">🔊</button>
@@ -88,54 +91,99 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 const $ = id => document.getElementById(id);
 const v = $("v"), screen = $("screen");
-let offset = 0, row = null, live = false;
+let offset = 0, row = null, live = false, ended = false, curUrl = "", lastEnd = 0;
 
 const fmt = s => { s = Math.max(0, s | 0); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
-const pos = () => (Date.now() + offset - new Date(row.started_at).getTime()) / 1000;
+// позиция в эфире: на паузе она заморожена, иначе считается по серверным часам
+const pos = () => row.paused ? (row.pause_pos || 0) : (Date.now() + offset - new Date(row.started_at).getTime()) / 1000;
+const canPlay = () => live && !ended && !(row && row.paused);
 
-async function apply(r) {
-  row = r;
-  const same = v.dataset.src === r.video_url + r.started_at;
-  if (!r.is_live || !r.video_url) return stop();
-  $("title").textContent = r.title || "RopTV";
-  if (same) return;
-  v.dataset.src = r.video_url + r.started_at;
-  live = true;
-  v.src = r.video_url;
-  v.onloadedmetadata = () => {
-    const p = pos();
-    if (p >= v.duration) return stop("Эфир закончился");
-    v.currentTime = Math.max(0, p);
-    v.play().catch(() => {});
-    $("off").classList.add("hide");
-    screen.classList.add("on");
-    if (v.muted && !$("gate").dataset.done) $("gate").classList.remove("hide");
-  };
-}
-function stop(msg) {
-  live = false; v.pause(); v.removeAttribute("src"); v.dataset.src = ""; v.load();
+function showOff(msg) {
   screen.classList.remove("on");
-  $("gate").classList.add("hide");
+  $("gate").classList.add("hide"); $("hold").classList.add("hide");
   $("off").classList.remove("hide");
   $("off").querySelector("h2").textContent = msg || "Эфир сейчас выключен";
+}
+function showLive() {
+  $("off").classList.add("hide");
+  screen.classList.add("on");
+  if (v.muted && !$("gate").dataset.done) $("gate").classList.remove("hide");
+}
+function stop(msg) {
+  live = false; ended = false; curUrl = "";
+  v.pause(); v.removeAttribute("src"); v.load();
+  showOff(msg);
   $("title").textContent = "—"; $("time").textContent = "";
 }
+// видео доиграло: просим сервер переключить на следующее из очереди (или выключить эфир)
+function finished() {
+  if (ended) return;
+  ended = true; v.pause();
+  showOff(row && row.queue && row.queue.length ? "Сейчас начнётся следующий мультик…" : "Эфир закончился");
+  endCheck();
+}
+function endCheck() {
+  if (!row || Date.now() - lastEnd < 2000) return;
+  lastEnd = Date.now();
+  sb.rpc("broadcast_ended", { ts: row.started_at }).then(() => {}, () => {});
+}
 
-// эфир нельзя поставить на паузу
-v.addEventListener("pause", () => { if (live && !v.ended) v.play().catch(() => {}); });
-v.addEventListener("ended", () => stop("Эфир закончился"));
+function apply(r) {
+  row = r;
+  if (!r.is_live || !r.video_url) return stop();
+  $("title").textContent = r.title || "RopTV";
+  ended = false; live = true;
+  // то же видео (пауза, продолжение, перемотка): не перезагружаем, только подстраиваем время
+  if (curUrl === r.video_url && v.getAttribute("src")) {
+    if (v.readyState >= 1) { showLive(); tick(); }
+    return;
+  }
+  curUrl = r.video_url;
+  v.src = r.video_url;
+  v.onloadedmetadata = () => {
+    if (!row.paused && pos() >= v.duration) return finished();
+    v.currentTime = Math.min(Math.max(0, pos()), v.duration);
+    showLive();
+    tick();
+  };
+}
+
+function tick() {
+  if (!row || !row.is_live) return;
+  if (ended) { endCheck(); return; }
+  if (!live || v.readyState < 1) return;
+  const p = pos(), dur = v.duration || 0;
+  if (!row.paused && dur && p >= dur) return finished();
+  if (row.paused) {
+    if (Math.abs(v.currentTime - p) > 0.3) v.currentTime = Math.min(p, dur || p);
+    if (!v.paused) v.pause();
+  } else {
+    if (Math.abs(v.currentTime - p) > 2.5) v.currentTime = p;
+    if (v.paused && !v.ended) v.play().catch(() => {});
+  }
+  $("hold").classList.toggle("hide", !row.paused);
+  $("time").textContent = fmt(v.currentTime) + " / " + fmt(dur);
+}
+
+// зрители не могут поставить эфир на паузу сами (только админ)
+v.addEventListener("pause", () => { if (canPlay() && !v.ended) v.play().catch(() => {}); });
+v.addEventListener("ended", () => finished());
 document.addEventListener("contextmenu", e => { if (e.target.closest("#screen")) e.preventDefault(); });
 document.addEventListener("keydown", e => { if (e.key === " " || e.key === "k" || e.key === "MediaPlayPause") e.preventDefault(); });
-setInterval(() => {
-  if (!live || !row) return;
-  const p = pos();
-  if (Math.abs(v.currentTime - p) > 2.5 && p < v.duration) v.currentTime = p;
-  if (v.paused) v.play().catch(() => {});
-  $("time").textContent = fmt(v.currentTime) + " / " + fmt(v.duration || 0);
-}, 1000);
+setInterval(tick, 1000);
+
+// страховка, если realtime пропустил обновление
+setInterval(async () => {
+  try {
+    const { data } = await sb.from("broadcast").select("*").eq("id", 1).single();
+    if (!data) return;
+    const k = r => [r.is_live, r.video_url, r.started_at, r.paused, r.pause_pos].join("|");
+    if (!row || k(row) !== k(data)) apply(data); else row = data;
+  } catch (e) {}
+}, 15000);
 
 // звук и экран
-$("join").onclick = () => { v.muted = false; $("gate").dataset.done = 1; $("gate").classList.add("hide"); v.play(); sync(); };
+$("join").onclick = () => { v.muted = false; $("gate").dataset.done = 1; $("gate").classList.add("hide"); if (canPlay()) v.play().catch(() => {}); sync(); };
 $("mute").onclick = () => { v.muted = !v.muted; sync(); };
 $("vol").oninput = e => { v.volume = e.target.value; v.muted = v.volume === 0; sync(); };
 function sync() { $("mute").textContent = v.muted ? "🔇" : "🔊"; }
@@ -143,7 +191,7 @@ function setFull(on) { screen.classList.toggle("full", on); document.body.style.
 function exitFull() { if (document.fullscreenElement) document.exitFullscreen(); setFull(false); }
 $("fs").onclick = () => {
   if (screen.classList.contains("full")) return exitFull();
-  if (!$("gate").dataset.done) { v.muted = false; $("gate").dataset.done = 1; $("gate").classList.add("hide"); v.play().catch(() => {}); sync(); }
+  if (!$("gate").dataset.done) { v.muted = false; $("gate").dataset.done = 1; $("gate").classList.add("hide"); if (canPlay()) v.play().catch(() => {}); sync(); }
   setFull(true); // свой полный экран: видны только водяной знак и картинка
   if (screen.requestFullscreen) screen.requestFullscreen().catch(() => {});
 };
