@@ -65,6 +65,7 @@ aside h3 span{color:var(--amber)}
         <video id="v" playsinline muted preload="auto" disablepictureinpicture controlslist="nodownload noplaybackrate"></video>
         <div class="bug">Rop<b>TV</b></div><div class="live">В ЭФИРЕ</div>
         <div class="ov" id="off"><h2>Эфир сейчас выключен</h2><p>Как только запустят видео, оно начнётся здесь само.</p></div>
+        <div class="ov hide" id="load"><h2>Загружаю видео…</h2><p id="loadp">0%</p></div>
         <div class="ov hold hide" id="hold"><h2>⏸ Эфир на паузе</h2><p>Скоро продолжим с того же места.</p></div>
         <div class="ov hide" id="gate"><h2>Идёт эфир</h2><button class="cta" id="join">Смотреть со звуком</button></div>
         <div class="bar">
@@ -92,6 +93,40 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 const $ = id => document.getElementById(id);
 const v = $("v"), screen = $("screen");
 let offset = 0, row = null, live = false, ended = false, curUrl = "", lastEnd = 0;
+let loadCtl = null, cache = { url: "", blob: "" };
+
+// ---- большие видео хранятся кусками (.p0 .p1 ...): скачиваем все части и склеиваем в один файл в памяти ----
+function parseMulti(url) {
+  const i = (url || "").indexOf("#"); if (i < 0) return null;
+  const q = new URLSearchParams(url.slice(i + 1)), n = +q.get("parts");
+  if (!(n > 1)) return null;
+  return { base: url.slice(0, i), n, size: +q.get("size") || 0, type: q.get("type") || "video/mp4" };
+}
+const newCtl = () => { const c = { aborted: false, xs: [], abort() { c.aborted = true; c.xs.forEach(x => { try { x.abort(); } catch (e) {} }); } }; return c; };
+function loadMedia(m, onp, ctl) {
+  const got = new Array(m.n).fill(0);
+  const report = () => onp(m.size ? Math.min(got.reduce((a, b) => a + b, 0) / m.size, 0.99) : 0);
+  const one = i => new Promise((res, rej) => {
+    let tries = 0;
+    const go = () => {
+      const x = new XMLHttpRequest(); ctl.xs.push(x);
+      x.open("GET", m.base + ".p" + i); x.responseType = "blob";
+      x.onprogress = e => { got[i] = e.loaded; report(); };
+      x.onload = () => x.status === 200 ? res(x.response) : fail();
+      x.onerror = () => fail();
+      const fail = () => { if (ctl.aborted) return rej(new Error("abort")); if (++tries < 3) setTimeout(go, 1000 * tries); else rej(new Error("part " + i)); };
+      x.send();
+    };
+    go();
+  });
+  return Promise.all(Array.from({ length: m.n }, (_, i) => one(i))).then(parts => URL.createObjectURL(new Blob(parts, { type: m.type })));
+}
+function showLoading(p) {
+  screen.classList.remove("on");
+  $("off").classList.add("hide"); $("gate").classList.add("hide"); $("hold").classList.add("hide");
+  $("load").classList.remove("hide");
+  $("loadp").textContent = Math.round(p * 100) + "%";
+}
 
 const fmt = s => { s = Math.max(0, s | 0); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
 // позиция в эфире: на паузе она заморожена, иначе считается по серверным часам
@@ -99,17 +134,18 @@ const pos = () => row.paused ? (row.pause_pos || 0) : (Date.now() + offset - new
 const canPlay = () => live && !ended && !(row && row.paused);
 
 function showOff(msg) {
-  screen.classList.remove("on");
+  screen.classList.remove("on"); $("load").classList.add("hide");
   $("gate").classList.add("hide"); $("hold").classList.add("hide");
   $("off").classList.remove("hide");
   $("off").querySelector("h2").textContent = msg || "Эфир сейчас выключен";
 }
 function showLive() {
-  $("off").classList.add("hide");
+  $("off").classList.add("hide"); $("load").classList.add("hide");
   screen.classList.add("on");
   if (v.muted && !$("gate").dataset.done) $("gate").classList.remove("hide");
 }
 function stop(msg) {
+  if (loadCtl) { loadCtl.abort(); loadCtl = null; }
   live = false; ended = false; curUrl = "";
   v.pause(); v.removeAttribute("src"); v.load();
   showOff(msg);
@@ -138,8 +174,30 @@ function apply(r) {
     if (v.readyState >= 1) { showLive(); tick(); }
     return;
   }
+  if (curUrl === r.video_url && loadCtl) return;   // та же большая загрузка ещё идёт
+  if (loadCtl) { loadCtl.abort(); loadCtl = null; }
   curUrl = r.video_url;
-  v.src = r.video_url;
+  const m = parseMulti(r.video_url);
+  if (!m) return setSrc(r.video_url);
+  if (cache.url === r.video_url) return setSrc(cache.blob);
+  v.pause(); v.removeAttribute("src"); v.load();   // предыдущее видео убираем, пока качаются части
+  showLoading(0);
+  const ctl = loadCtl = newCtl();
+  loadMedia(m, p => { if (!ctl.aborted) showLoading(p); }, ctl).then(u => {
+    if (ctl.aborted) { URL.revokeObjectURL(u); return; }
+    loadCtl = null;
+    if (cache.blob) URL.revokeObjectURL(cache.blob);
+    cache = { url: r.video_url, blob: u };
+    setSrc(u);
+  }).catch(() => {
+    if (ctl.aborted) return;
+    loadCtl = null; curUrl = "";
+    showOff("Не удалось загрузить видео. Пробую ещё раз…");
+    setTimeout(() => { if (row && row.is_live && !curUrl) apply(row); }, 5000);
+  });
+}
+function setSrc(src) {
+  v.src = src;
   v.onloadedmetadata = () => {
     if (!row.paused && pos() >= v.duration) return finished();
     v.currentTime = Math.min(Math.max(0, pos()), v.duration);
