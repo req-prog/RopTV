@@ -161,7 +161,7 @@ function finished() {
 function endCheck() {
   if (!row || Date.now() - lastEnd < 2000) return;
   lastEnd = Date.now();
-  sb.rpc("broadcast_ended", { ts: row.started_at }).then(() => {}, () => {});
+  sb.rpc("broadcast_ended", { ts: row.started_at, d: isFinite(v.duration) ? v.duration : null }).then(() => {}, () => {});
 }
 
 function apply(r) {
